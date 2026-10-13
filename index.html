@@ -164,6 +164,7 @@
   </div>
 </div>
 
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
 <script>
 (() => {
   // =====================================================================
@@ -501,34 +502,156 @@
   const seenHits = new Set(), seenReports = new Set();
   let reports = [], reportKey = 1, lastSend = 0, hostCache = null;
 
-  (async () => {
-    try { lobby = window.claude && window.claude.use ? await window.claude.use('room') : null; } catch (e) { lobby = null; }
-    paintNetNote();
-  })();
+  // Online rooms run peer to peer through PeerJS: the room creator's browser hosts,
+  // everyone else connects to it and the host relays each player's state to all.
+  const PEER_PREFIX = 'rooftoprumble-v1-';
+  lobby = typeof window.Peer === 'function' ? true : null;
+  paintNetNote();
+  function makeRoom(code, create) {
+    return new Promise((resolve, reject) => {
+      const hostId = PEER_PREFIX + code.toLowerCase();
+      const myLabel = (create ? 'a-' : 'b-') + Math.random().toString(36).slice(2, 10);
+      let peer;
+      try { peer = create ? new window.Peer(hostId) : new window.Peer(); } catch (e) { reject({ code: 'net' }); return; }
+      const state = new Map();
+      const conns = new Map();
+      const handlers = new Set(), errHandlers = new Set();
+      let hostConn = null, settled = false, closed = false, cache = null, pendJoin = [], pendLeft = [], notifyT = null, sendT = null, dirty = false;
+      const fail = (code) => { if (!settled) { settled = true; clearTimeout(timer); try { peer.destroy(); } catch (e) {} reject({ code }); } else lost(); };
+      const lost = () => { if (closed) return; closed = true; errHandlers.forEach((h) => { try { h({ code: 'upstream_error' }); } catch (e) {} }); };
+      const timer = setTimeout(() => fail('timeout'), 15000);
+      const peersList = () => {
+        if (!cache) cache = [...state.entries()].map(([label, presence]) => ({ peer: label, presence, sameTab: label === myLabel }));
+        return cache;
+      };
+      function notify(joined, left) {
+        cache = null;
+        if (joined) pendJoin.push(joined);
+        if (left) pendLeft.push(left);
+        if (notifyT) return;
+        notifyT = setTimeout(() => {
+          notifyT = null;
+          const all = peersList();
+          const change = { peers: all, joined: all.filter((p) => pendJoin.includes(p.peer)), left: pendLeft.map((l) => ({ peer: l })) };
+          pendJoin = []; pendLeft = [];
+          handlers.forEach((h) => { try { h(change); } catch (e) { console.error(e); } });
+        }, 30);
+      }
+      function setPresence(label, pres) {
+        const isNew = !state.has(label);
+        state.set(label, pres);
+        notify(isNew ? label : null, null);
+      }
+      // host: send everyone the whole room ~20 times a second when something changed
+      function hostTick() {
+        if (!dirty) return;
+        dirty = false;
+        const msg = { t: 's', s: Object.fromEntries(state) };
+        conns.forEach((c) => { if (c.open) { try { c.send(msg); } catch (e) {} } });
+      }
+      const room = {
+        peers: peersList,
+        onPeers(fn, onErr) {
+          handlers.add(fn); if (onErr) errHandlers.add(onErr);
+          setTimeout(() => { const all = peersList(); try { fn({ peers: all, joined: all, left: [] }); } catch (e) { console.error(e); } }, 0);
+          return () => { handlers.delete(fn); if (onErr) errHandlers.delete(onErr); };
+        },
+        presence(pres) {
+          if (closed) return Promise.resolve();
+          const isNew = !state.has(myLabel);
+          state.set(myLabel, pres); cache = null;
+          if (isNew) notify(myLabel, null);
+          if (create) dirty = true;
+          else if (hostConn && hostConn.open) { try { hostConn.send({ t: 'p', l: myLabel, p: pres }); } catch (e) {} }
+          return Promise.resolve();
+        },
+        async leave() {
+          closed = true; clearInterval(sendT); clearTimeout(timer);
+          try { peer.destroy(); } catch (e) {}
+        }
+      };
+      peer.on('error', (err) => {
+        const t = err && err.type;
+        if (t === 'unavailable-id') fail('taken');
+        else if (t === 'peer-unavailable') fail('not_found');
+        else if (!settled) fail('net');
+        else if (t === 'network' || t === 'disconnected' || t === 'server-error' || t === 'socket-error' || t === 'socket-closed') { /* host keeps running for players already connected */ }
+      });
+      if (create) {
+        peer.on('open', () => {
+          settled = true; clearTimeout(timer);
+          sendT = setInterval(hostTick, 50);
+          resolve(room);
+        });
+        peer.on('connection', (c) => {
+          if (conns.size >= 7) { c.on('open', () => c.close()); return; }
+          c.on('data', (msg) => {
+            if (!msg || msg.t !== 'p' || typeof msg.l !== 'string' || !msg.p || typeof msg.p !== 'object') return;
+            const label = 'b-' + msg.l.replace(/^[ab]-/, '').slice(0, 16);
+            if (c.label && c.label !== label) return;
+            c.label = label; conns.set(label, c);
+            setPresence(label, msg.p); dirty = true;
+          });
+          const gone = () => { if (c.label && conns.get(c.label) === c) { conns.delete(c.label); state.delete(c.label); dirty = true; notify(null, c.label); } };
+          c.on('close', gone); c.on('error', gone);
+        });
+      } else {
+        peer.on('open', () => {
+          hostConn = peer.connect(hostId, { serialization: 'json', reliable: true });
+          hostConn.on('open', () => {
+            settled = true; clearTimeout(timer);
+            if (state.has(myLabel)) hostConn.send({ t: 'p', l: myLabel, p: state.get(myLabel) });
+            resolve(room);
+          });
+          hostConn.on('data', (msg) => {
+            if (!msg || msg.t !== 's' || !msg.s || typeof msg.s !== 'object') return;
+            const incoming = new Map(Object.entries(msg.s));
+            for (const label of [...state.keys()]) if (label !== myLabel && !incoming.has(label)) { state.delete(label); notify(null, label); }
+            for (const [label, pres] of incoming) {
+              if (label === myLabel || !pres || typeof pres !== 'object') continue;
+              const isNew = !state.has(label);
+              state.set(label, pres);
+              notify(isNew ? label : null, null);
+            }
+          });
+          hostConn.on('close', () => fail('closed'));
+          hostConn.on('error', () => fail('closed'));
+        });
+      }
+    });
+  }
   function paintNetNote() {
     const note = $('net-note');
-    if (lobby) { note.innerHTML = 'Online rooms are on. <b>Up to 8 players.</b> Friends join by opening this same game on claude.ai (signed in) and typing your code.'; note.classList.remove('err'); $('m-create').disabled = false; $('m-join').disabled = false; }
-    else { note.innerHTML = 'Online rooms only work when this game is opened on <b>claude.ai while signed in</b>. Solo and 2-players-1-keyboard work anywhere.'; $('m-create').disabled = true; $('m-join').disabled = true; }
+    if (lobby) { note.innerHTML = 'Online rooms are on. <b>Up to 8 players.</b> Create a room, send the code to your friends, and they open this same link and type it in. Keep your game open: you are the host.'; note.classList.remove('err'); $('m-create').disabled = false; $('m-join').disabled = false; }
+    else { note.innerHTML = 'Online rooms could not load. Check your internet and refresh. Solo and 2-players-1-keyboard still work.'; $('m-create').disabled = true; $('m-join').disabled = true; }
   }
   const sortedPeers = () => (room ? room.peers().filter((p) => p.presence && p.presence.v === 1).map((p) => p.peer).sort() : []);
   const isHost = () => !room || (myPeer && sortedPeers()[0] === myPeer);
   const isSim = () => mode === 'solo' || (mode === 'online' && isHost());
   function remoteList() { return [...remotes.values()]; }
 
-  async function joinRoom(code) {
-    if (!lobby) return;
+  let joining = false;
+  async function joinRoom(code, create = false, tries = 3) {
+    if (!lobby || joining) return;
     const note = $('net-note');
+    joining = true;
+    note.textContent = create ? 'Creating your room…' : 'Joining room ' + code.toUpperCase() + '…'; note.classList.remove('err');
     try {
       if (room) await leaveRoom();
-      room = await lobby.join('rumble-' + code.toLowerCase());
+      room = await makeRoom(code, create);
+      joining = false;
       roomCode = code.toUpperCase();
       remotes.clear(); seenHits.clear(); seenReports.clear(); enemies = []; wave = { n: 0, t: 3 }; hostCache = null;
       room.onPeers(onPeers, () => { banner('Lost the room connection'); });
       startMatch('online');
     } catch (e) {
-      note.textContent = e && e.code === 'limit_reached' ? 'Too many rooms open right now. Try again in a moment.' : e && e.code === 'not_permitted' ? 'Online rooms are not available for your account here.' : 'Could not join the room. Check the code and try again.';
-      note.classList.add('err');
+      joining = false;
       room = null;
+      if (create && e && e.code === 'taken' && tries > 1) { joinRoom(newCode(), true, tries - 1); return; }
+      note.textContent = e && e.code === 'not_found' ? 'No room with that code. Check the code, and make sure your friend still has the game open.'
+        : e && e.code === 'timeout' ? 'Could not connect in time. Check your internet and try again.'
+        : create ? 'Could not create a room right now. Try again in a moment.' : 'Could not join the room. Check the code and try again.';
+      note.classList.add('err');
     }
   }
   async function leaveRoom() { if (room) { try { await room.leave(); } catch (e) {} } room = null; roomCode = null; remotes.clear(); }
@@ -1026,7 +1149,7 @@
     sw.appendChild(b);
   });
   const newCode = () => Array.from({ length: 4 }, () => 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'[Math.floor(Math.random() * 31)]).join('');
-  $('m-create').addEventListener('click', () => { gameMode = 'pvp'; joinRoom(newCode()); });
+  $('m-create').addEventListener('click', () => { gameMode = 'pvp'; joinRoom(newCode(), true); });
   const doJoin = () => {
     const code = $('in-code').value.trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
     if (code.length < 3) { $('net-note').textContent = 'Type the room code your friend sent you.'; $('net-note').classList.add('err'); return; }
