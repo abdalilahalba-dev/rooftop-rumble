@@ -588,11 +588,11 @@
           c.on('data', (msg) => {
             if (!msg || msg.t !== 'p' || typeof msg.l !== 'string' || !msg.p || typeof msg.p !== 'object') return;
             const label = 'b-' + msg.l.replace(/^[ab]-/, '').slice(0, 16);
-            if (c.label && c.label !== label) return;
-            c.label = label; conns.set(label, c);
+            if (c.rrLabel && c.rrLabel !== label) return;
+            c.rrLabel = label; conns.set(label, c);
             setPresence(label, msg.p); dirty = true;
           });
-          const gone = () => { if (c.label && conns.get(c.label) === c) { conns.delete(c.label); state.delete(c.label); dirty = true; notify(null, c.label); } };
+          const gone = () => { if (c.rrLabel && conns.get(c.rrLabel) === c) { conns.delete(c.rrLabel); state.delete(c.rrLabel); dirty = true; notify(null, c.rrLabel); } };
           c.on('close', gone); c.on('error', gone);
         });
       } else {
